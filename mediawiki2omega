@@ -1,0 +1,127 @@
+#!/usr/bin/perl -w
+# mediawki2omega - dump a MediaWiki database into a form suitable for indexing
+# into a Xapian database using scriptindex.  This script requires the perl DBI
+# interface to be installed (on Debian systems, this is provided by the
+# libdbi-perl package).
+#
+# Copyright (c) 2018 Alan Dennis
+#
+# Adapted from dbi2omega, Copyright (c) 2002,2006 Olly Betts
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; either version 2 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+# USA
+
+use strict;
+use DBI;
+
+# pod to be read with "perldoc mediawki2omega" etc
+=pod
+
+=head1 mediawki2omega quick howto ...
+
+=over
+
+=item * edit $wgXxxx variables to match MediaWiki LocalSettings.php (e.g. /etc/mediawiki/LocalSettings.php)
+
+=item * dump MediaWiki to file : ./mediawiki2omega > mediawiki.dump
+
+=item * index dump into xapian/omega : scriptindex /var/lib/xapian-omega/data/default mediawiki.script mediawiki.dump
+
+=item * add daily cron entry just after midnight for yesterdays updates, e.g. 5 0 * * * mediawiki2omega --cron > mediawiki.dump;scriptindex ...
+
+=back
+
+=head1 limitations
+
+=over
+
+=item * only dumps Main namespace, not Talk:, User: etc namespaces
+
+=item * assumes wiki, database and xapian/omega are all on the localhost machine
+
+=back
+
+=cut
+
+# edit these settings to match MediaWiki LocalSettings.php
+my $wgDBname           = "wikidb";
+my $wgDBuser           = "wikiuser";
+my $wgDBpassword       = "wikipass";
+my $wgDBtype           = "mysql";
+my $wgScriptPath       = "/w";
+my $wgScriptExtension  = ".php";
+
+# The bit of the url between the hostname and the page title
+# e.g. for http://127.0.0.1:8080/w/index.php/Main_Page $urlbase is "/w/index.php/"
+my $urlbase = "$wgScriptPath/index$wgScriptExtension/";
+
+my $cron_where = "";
+if ($#ARGV >= 0 && $ARGV[0] eq "--cron")
+{
+	$cron_where = " AND page_touched>=DATE_FORMAT(CURDATE()-1, '%Y%m%d000000')";
+}
+
+my $dbh = DBI->connect("DBI:$wgDBtype:$wgDBname", $wgDBuser, $wgDBpassword)
+  or die "Couldn't connect to database: " . DBI->errstr;
+
+# page_namespace=0 WHERE clause to fetch "MAIN" pages (with regular urls only). See Manual:Namespace_constants
+# for other namespaces, e.g. 8=Mediawiki:x (e.g. Sidebar) 10=Template:x (e.g. TOC) 14=Category:x
+
+my $sth = $dbh->prepare("SELECT CONCAT('wiki',page_id) as ref, page_title, CONCAT('$urlbase',page_title) as url" . 
+							", 'text/html' as type, page_is_redirect, old_id, old_text" . 
+							", left(page_touched,8) as date, left(page_touched,6) as month, left(page_touched,4) as year" .
+							", length(old_text) as size, unix_timestamp(page_touched) as modtime" .
+							" FROM page, revision, text WHERE rev_id=page_latest AND old_id=rev_text_id AND page_namespace=0" . $cron_where)
+  or die "Couldn't prepare statement: " . $dbh->errstr;
+
+$sth->execute()
+  or die "Couldn't execute statement: " . $sth->errstr;
+
+# The following creates the script for scriptindex for the fields extracted from the database in the query above
+
+# Wouldn't it be great if scriptindex could take these field defs at the start of the data (sort of like a
+# header row in a CSV)? Then it wouldn't need a separate file and stdout here could just be piped into it.
+
+open (SCRIPT, ">mediawiki.script");
+print SCRIPT 
+qq{ref : boolean=Q unique=Q
+page_title : field=caption weight=3 index
+url : field boolean=U
+type : field boolean=T
+page_is_redirect :
+old_id :
+old_text : index truncate=200 field=sample
+date : boolean=D
+month : boolean=M
+year : boolean=Y
+size : field
+modtime: field
+};
+close SCRIPT;
+
+my $data;
+while (defined($data = $sth->fetchrow_arrayref())) {
+  for my $i (0 .. $sth->{NUM_OF_FIELDS} - 1) {
+    my $v = $$data[$i];
+    if (defined($v)) {
+      $v =~ s/\n/\n=/g;
+      print "${$sth->{NAME_lc}}[$i]=$v\n";
+    }
+  }
+  print "\n";
+}
+$sth->err and die "Couldn't fetch row: " . $sth->errstr;
+
+$dbh->disconnect;
